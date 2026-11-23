@@ -1,0 +1,15 @@
+services:
+  ticket-api:
+    build: .
+    image: ticket-backfill-api:latest
+    container_name: ticket-backfill-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ticket-data:/data
+    environment:
+      TICKET_DB_PATH: /data/tickets.db
+    restart: unless-stopped
+
+volumes:
+  ticket-data:

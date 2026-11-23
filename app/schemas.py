@@ -79,3 +79,47 @@ class SeasonSummary(BaseModel):
     end_date: date
     current_batch: int
     feasible: bool
+
+
+class CorrectionOptionResult(BaseModel):
+    """一张可单独订正的单据：只改它一张即可让整批成立的总数整数区间。"""
+
+    order_no: str
+    current_total: int
+    min_total: int = Field(ge=0, le=MAX_TOTAL)
+    max_total: int = Field(ge=0, le=MAX_TOTAL)
+
+
+class CorrectionPreviewResponse(BaseModel):
+    season_id: str
+    batch_no: int
+    feasible: bool
+    contradiction_proof: list[str]
+    # 只含"改这一张就能让整批成立"的单据；空列表表示必须改多张。
+    options: list[CorrectionOptionResult]
+
+
+class CorrectionRequest(BaseModel):
+    # 复核原件后所见的批号（乐观并发），必须等于当前生效批号。
+    seen_batch: int = Field(ge=1)
+    order_no: str = Field(min_length=1, max_length=64)
+    new_total: int = Field(ge=0, le=MAX_TOTAL)
+
+    @field_validator("order_no")
+    @classmethod
+    def _strip_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("单号不能为空")
+        return v
+
+
+class CorrectionResponse(BaseModel):
+    season_id: str
+    batch_no: int
+    feasible: bool
+    corrected_order_no: str
+    new_total: int
+    n_orders: int
+    contradiction_proof: list[str]
+    message: str = "订正已随新批号发布，新单据与核算结果已一同生效"

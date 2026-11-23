@@ -13,7 +13,6 @@ from __future__ import annotations
 import threading
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
-from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -21,6 +20,10 @@ from fastapi.responses import JSONResponse
 from . import database as db
 from .schemas import (
     AccountingResponse,
+    CorrectionPreviewResponse,
+    CorrectionOptionResult,
+    CorrectionRequest,
+    CorrectionResponse,
     DayResult,
     OrderPayload,
     OrderResult,
@@ -28,8 +31,9 @@ from .schemas import (
     SubmissionRequest,
     SubmissionResponse,
     MAX_SEASON_DAYS,
+    MAX_TOTAL,
 )
-from .solver import OrderInput, solve
+from .solver import OrderInput, correction_options, solve
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -257,6 +261,164 @@ def get_accounting(season_id: str) -> AccountingResponse:
         return _build_accounting(season_id, start, end, batch_no, feasible, conn)
     finally:
         conn.close()
+
+
+@app.get(
+    "/api/seasons/{season_id}/batches/{batch_no}/corrections",
+    response_model=CorrectionPreviewResponse,
+)
+def preview_corrections(season_id: str, batch_no: int) -> CorrectionPreviewResponse:
+    """矛盾批订正试算：列出所有可单独订正的单号与总数可填整数区间。
+
+    只读接口，不持写锁：试算期间本季仍可从原入口（交单/订正）换交。
+    核算次数只取决于已存矛盾证据中的单数，证据之外再增加单据也不会增加。
+    """
+    conn = db.connect()
+    try:
+        season = db.get_season(conn, season_id)
+        if season is None:
+            raise HTTPException(404, f"演出季 {season_id} 不存在")
+        current = db.current_batch_no(conn, season_id)
+        if batch_no != current:
+            raise HTTPException(
+                409,
+                f"批号已过期：所见批号 {batch_no}，当前生效批号 {current}，"
+                "请按当前生效批号重新试算",
+            )
+        row = conn.execute(
+            "SELECT feasible FROM batches WHERE season_id = ? AND batch_no = ?",
+            (season_id, batch_no),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, f"演出季 {season_id} 不存在批号 {batch_no}")
+        if bool(row["feasible"]):
+            raise HTTPException(409, f"批号 {batch_no} 本身可行，无需订正")
+
+        n_days = int(season["n_days"])
+        order_rows = db.load_orders(conn, season_id, batch_no)
+        order_inputs = [
+            OrderInput(
+                order_no=r["order_no"], l=int(r["l_idx"]),
+                r=int(r["r_idx"]), total=int(r["total"]),
+            )
+            for r in order_rows
+        ]
+        proof = db.load_contradictions(conn, season_id, batch_no)
+        options = correction_options(n_days, order_inputs, proof, MAX_TOTAL)
+        return CorrectionPreviewResponse(
+            season_id=season_id,
+            batch_no=batch_no,
+            feasible=False,
+            contradiction_proof=proof,
+            options=[
+                CorrectionOptionResult(
+                    order_no=o.order_no,
+                    current_total=o.current_total,
+                    min_total=o.min_total,
+                    max_total=o.max_total,
+                )
+                for o in options
+            ],
+        )
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/api/seasons/{season_id}/corrections",
+    response_model=CorrectionResponse,
+)
+def submit_correction(season_id: str, payload: CorrectionRequest) -> CorrectionResponse:
+    """复核原件后提交订正：只改指定单据的总数，整批成立才按新批号发布。
+
+    与交单共用本季互斥锁与 BEGIN IMMEDIATE 事务。发布前批号已变、
+    订正后整批仍无解或保存失败，均不产生新批，沿用当时的生效批次。
+    """
+    lock = _season_lock(season_id)
+    with lock:
+        conn = db.connect()
+        try:
+            with db.transaction(conn):
+                season = db.get_season(conn, season_id)
+                if season is None:
+                    raise HTTPException(404, f"演出季 {season_id} 不存在")
+                current = db.current_batch_no(conn, season_id)
+                if current == 0:
+                    raise HTTPException(404, f"演出季 {season_id} 尚无生效批次")
+                if payload.seen_batch != current:
+                    raise HTTPException(
+                        409,
+                        f"批号已过期：所见批号 {payload.seen_batch}，"
+                        f"当前生效批号 {current}，本次订正未生效，沿用当前批",
+                    )
+
+                cur = conn.execute(
+                    "SELECT feasible FROM batches WHERE season_id = ? AND batch_no = ?",
+                    (season_id, current),
+                ).fetchone()
+                if bool(cur["feasible"]):
+                    raise HTTPException(
+                        409, f"当前生效批号 {current} 本身可行，无需订正"
+                    )
+
+                order_rows = db.load_orders(conn, season_id, current)
+                target = next(
+                    (r for r in order_rows if r["order_no"] == payload.order_no), None
+                )
+                if target is None:
+                    raise HTTPException(
+                        404,
+                        f"批号 {current} 中不存在单据 {payload.order_no}",
+                    )
+
+                n_days = int(season["n_days"])
+                order_inputs = [
+                    OrderInput(
+                        order_no=r["order_no"],
+                        l=int(r["l_idx"]),
+                        r=int(r["r_idx"]),
+                        total=(
+                            payload.new_total
+                            if r["order_no"] == payload.order_no
+                            else int(r["total"])
+                        ),
+                    )
+                    for r in order_rows
+                ]
+                result = solve(n_days, order_inputs)
+                if not result.feasible:
+                    raise HTTPException(
+                        409,
+                        f"把单据 {payload.order_no} 总数改为 {payload.new_total} "
+                        "后整批仍无解，本次订正未生效，沿用当前批",
+                    )
+
+                new_batch = current + 1
+                db.insert_batch(conn, season_id, new_batch, True)
+                db.insert_orders(
+                    conn,
+                    season_id,
+                    new_batch,
+                    [(o.order_no, o.l, o.r, o.total) for o in order_inputs],
+                )
+                db.insert_daily_bounds(
+                    conn,
+                    season_id,
+                    new_batch,
+                    [(d.day_index, d.min_tickets, d.max_tickets) for d in result.days],
+                )
+
+                return CorrectionResponse(
+                    season_id=season_id,
+                    batch_no=new_batch,
+                    feasible=True,
+                    corrected_order_no=payload.order_no,
+                    new_total=payload.new_total,
+                    n_orders=len(order_inputs),
+                    contradiction_proof=[],
+                )
+        finally:
+            conn.close()
 
 
 @app.get("/api/seasons", response_model=list[SeasonSummary])

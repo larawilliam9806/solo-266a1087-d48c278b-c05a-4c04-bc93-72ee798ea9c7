@@ -75,6 +75,16 @@ class SolveResult:
     contradiction_proof: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CorrectionOption:
+    """一张可单独订正的单据：只改它一张时总数可取的整数闭区间。"""
+
+    order_no: str
+    current_total: int
+    min_total: int
+    max_total: int
+
+
 def _floyd(n_nodes: int, edges: list[Edge]) -> np.ndarray:
     """全点对最长路，返回距离矩阵（不可达为 NEG）。"""
     dist = np.full((n_nodes, n_nodes), NEG, dtype=np.int64)
@@ -108,13 +118,22 @@ def _is_feasible(n_days: int, orders: list[OrderInput]) -> tuple[bool, np.ndarra
     return not bool(np.any(np.diag(dist) > 0)), dist
 
 
-def _subset_feasible(n_days: int, subset: list[OrderInput]) -> bool:
-    """只在候选单据子集上判可行性：Floyd 规模随子集缩约快速下降。"""
-    if not subset:
-        return True
+def _compressed_floyd(
+    n_days: int,
+    subset: list[OrderInput],
+    extra_nodes: Optional[set[int]] = None,
+) -> tuple[np.ndarray, dict[int, int]]:
+    """在只含相关前缀节点的压缩图上跑最长路。
+
+    只保留 0、n_days、各单据端点（及 extra_nodes），非负性的 0 权边
+    压缩为相邻保留节点之间的跨接边。路径权值与原图一致（中间边均为 0），
+    但节点规模随单据数缩约，Floyd 更快。返回距离矩阵与原节点->压缩下标。
+    """
     touched = {0, n_days}
     for o in subset:
         touched.update((o.l - 1, o.r))
+    if extra_nodes:
+        touched.update(extra_nodes)
     nodes = sorted(touched)
     index = {node: i for i, node in enumerate(nodes)}
     m = len(nodes)
@@ -127,7 +146,14 @@ def _subset_feasible(n_days: int, subset: list[OrderInput]) -> bool:
         edges.append(Edge(index[o.l - 1], index[o.r], o.total, o.order_no))
         edges.append(Edge(index[o.r], index[o.l - 1], -o.total, o.order_no))
 
-    dist = _floyd(m, edges)
+    return _floyd(m, edges), index
+
+
+def _subset_feasible(n_days: int, subset: list[OrderInput]) -> bool:
+    """只在候选单据子集上判可行性：Floyd 规模随子集缩约快速下降。"""
+    if not subset:
+        return True
+    dist, _ = _compressed_floyd(n_days, subset)
     return not bool(np.any(np.diag(dist) > 0))
 
 
@@ -149,7 +175,8 @@ def _contradiction_proof(
 
     # 贪心缩约：逐个尝试移除，移除后仍矛盾则永久剔除，
     # 得到包含意义下极小的矛盾单据组。检查始终只在候选子集上进行。
-    proof = list(candidates)
+    # 按单号排序保证输出确定，不受集合迭代顺序（哈希随机化）影响。
+    proof = sorted(candidates)
     for no in list(proof):
         subset = [by_no[n] for n in proof if n != no]
         if not _subset_feasible(n_days, subset):
@@ -171,3 +198,61 @@ def solve(n_days: int, orders: list[OrderInput]) -> SolveResult:
         max_v = None if back == NEG else int(-back)
         days.append(DayBound(day_index=d, min_tickets=min_v, max_tickets=max_v))
     return SolveResult(feasible=True, days=days)
+
+
+def correction_options(
+    n_days: int,
+    orders: list[OrderInput],
+    proof: list[str],
+    max_total: int,
+) -> list[CorrectionOption]:
+    """列出所有"只改一张就能让整批成立"的单据及其总数可填整数区间。
+
+    试算规则
+    --------
+    * 只评估已存矛盾证据 ``proof`` 中的单据：不在证据里的单据不可能
+      单独承担矛盾（其边不在任何正环上），证据之外再加单据不会增加
+      本函数的核算次数，每次试算都保留其余全部单据；
+    * 对候选单 o（区间 [l,r]），取除 o 之外所有单据构成的"余下图"，
+      在压缩图上跑一次最长路。余下图仍有正环 => 改 o 一张无救，跳过；
+    * 余下图可行时，新总数 t 必须同时满足
+          p_r - p_{l-1} = t
+      的两个半空间约束：
+          t >= 每条 (l-1) -> r 路径权值的最大值 dist[a][b]（a=l-1, b=r）
+          t <= -dist[b][a]（b=r 到 a=l-1 的最长路取负）
+      不可达方向不产生界；再与非负/总数上限取交，得到整数闭区间。
+
+    整数性同样由区间约束矩阵的全幺模性保证：区间内每个整数 t 都对应
+    一个非负整数日账，不会出现松弛可行而整数无解。
+    """
+    by_no = {o.order_no: o for o in orders}
+    options: list[CorrectionOption] = []
+
+    # 按单号排序试算，保证 options 顺序确定，不依赖外部集合顺序。
+    for no in sorted(proof):
+        target = by_no[no]
+        others = [o for o in orders if o.order_no != no]
+        a, b = target.l - 1, target.r
+
+        dist, index = _compressed_floyd(n_days, others, extra_nodes={a, b})
+        ia, ib = index[a], index[b]
+
+        # 余下图自身仍矛盾：只改这一张无法让整批成立。
+        if bool(np.any(np.diag(dist) > 0)):
+            continue
+
+        lower = 0 if dist[ia, ib] == NEG else int(dist[ia, ib])
+        upper = max_total if dist[ib, ia] == NEG else int(-dist[ib, ia])
+        lower = max(lower, 0)
+        upper = min(upper, max_total)
+        if lower <= upper:
+            options.append(
+                CorrectionOption(
+                    order_no=no,
+                    current_total=target.total,
+                    min_total=lower,
+                    max_total=upper,
+                )
+            )
+
+    return options
